@@ -1,0 +1,38 @@
+# aeroPanel configuration
+# Copy to ~/.config/aeropanel/config.toml
+# Keys are looked up in order: $AEROPANEL_CONFIG, ~/.config/aeropanel/config.toml
+
+[general]
+refresh_secs = 3        # metrics poll interval
+log_tail_lines = 300    # how many lines of log history to keep in memory
+
+# ─── Servers ──────────────────────────────────────────────────────
+# mode: "local" (this machine) or "ssh"
+
+[[server]]
+name = "home-server"
+mode = "ssh"
+host = "192.168.1.10"
+port = 22
+user = "lebadura"
+key = ""                      # empty = default key / ssh-agent
+minecraft = false
+
+[[server]]
+name = "mc-main"
+mode = "ssh"
+host = "192.168.1.10"
+user = "lebadura"
+minecraft = true
+
+  [server.minecraft]
+  # Command used to open an interactive console to the server.
+  # Its stdin = server console, stdout = server log.
+  # Examples:
+  #   docker exec -i mc-main rcon-cli
+  #   tail -F /opt/mc/logs/latest.log   (read-only, no console)
+  console_command = "docker exec -i mc-main rcon-cli"
+  log_command = "tail -F -n 100 /opt/mc/logs/latest.log"   # optional: stream logs when console is read-only
+  send_tps_cmd = true          # periodically write 'tps' to console to sample TPS
+  tps_interval_secs = 20
+  expected_max_tps = 20.0
