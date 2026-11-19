@@ -35,12 +35,16 @@ pub struct MinecraftCfg {
     pub instance_dir: String,
     #[serde(default)]
     pub version: String,
+    /// paper | purpur | fabric | vanilla | neoforge | forge
+    #[serde(default = "d_core")]
+    pub core: String,
     #[serde(default)]
     pub memory: String,
     #[serde(default)]
     pub auto_start: bool,
 }
 
+fn d_core() -> String { "paper".into() }
 fn d_true() -> bool { true }
 fn d_tps_interval() -> u64 { 20 }
 fn d_maxtps() -> f64 { 20.0 }
@@ -55,6 +59,7 @@ impl Default for MinecraftCfg {
             expected_max_tps: d_maxtps(),
             instance_dir: String::new(),
             version: String::new(),
+            core: d_core(),
             memory: String::new(),
             auto_start: false,
         }
@@ -87,11 +92,49 @@ impl ServerCfg {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct Schedule {
+    pub name: String,
+    pub server: String,
+    /// backup | restart | command
+    pub action: String,
+    /// cada N segundos
+    #[serde(default)]
+    pub every_secs: Option<u64>,
+    /// "HH:MM" diario
+    #[serde(default)]
+    pub at: Option<String>,
+    /// si action = command
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct Notify {
+    #[serde(default)]
+    pub discord_webhook: String,
+    #[serde(default)]
+    pub telegram_token: String,
+    #[serde(default)]
+    pub telegram_chat: String,
+    /// avisar si TPS 1m baja de esto (0 = desactivado)
+    #[serde(default)]
+    pub tps_below: Option<f64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct Config {
     #[serde(default)]
     pub general: General,
     #[serde(default)]
     pub server: Vec<ServerCfg>,
+    #[serde(default)]
+    pub schedule: Vec<Schedule>,
+    #[serde(default)]
+    pub notify: Notify,
+}
+
+pub fn config_dir() -> PathBuf {
+    dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("aeropanel")
 }
 
 pub fn config_path() -> PathBuf {

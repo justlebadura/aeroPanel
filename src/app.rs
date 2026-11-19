@@ -157,13 +157,26 @@ pub struct App {
     pub spinner_frame: usize,
     pub quit: bool,
     pub line_tx: crate::connection::LineTx,
+    /// cliente del daemon (unix socket) — Some ⇒ operaciones por el daemon
+    pub daemon_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// índice del jugador seleccionado en la pestaña Minecraft
+    pub mc_player_sel: usize,
     pub cfg_path: std::path::PathBuf,
+}
+
+impl App {
+    /// jugador actualmente seleccionado ("") si no hay
+    pub fn mc_target(&self) -> String {
+        self.sel()
+            .and_then(|s| s.health.online.get(self.mc_player_sel).cloned())
+            .unwrap_or_default()
+    }
 }
 
 pub const FORM_FIELDS: [&str; 7] = [
     "name", "mode(local|ssh)", "host", "port", "user", "minecraft(y/n)", "console_command",
 ];
-pub const INSTANCE_FIELDS: [&str; 4] = ["nombre", "version (ej 1.21.4)", "ram (ej 4G)", "auto_start(y/n)"];
+pub const INSTANCE_FIELDS: [&str; 5] = ["nombre", "core (paper|purpur|fabric|vanilla|neoforge|forge)", "version (ej 1.21.4)", "ram (ej 4G)", "auto_start(y/n)"];
 
 impl App {
     pub fn new(cfg: Config, cfg_path: std::path::PathBuf, line_tx: crate::connection::LineTx) -> Self {
@@ -218,12 +231,18 @@ impl App {
             spinner_frame: 0,
             quit: false,
             line_tx,
+            daemon_tx: None,
+            mc_player_sel: 0,
             cfg_path,
         }
     }
 
     pub fn cfg_secs(&self) -> u64 {
         3
+    }
+
+    pub fn server_index(&self, name: &str) -> Option<usize> {
+        self.servers.iter().position(|s| s.cfg.name == name)
     }
 
     pub fn sel(&self) -> Option<&Server> {
@@ -291,7 +310,7 @@ impl App {
             return;
         }
         let dirp = std::path::PathBuf::from(&dir);
-        let cmd_str = crate::instances::java_cmd(&dirp, &version, &memory);
+        let cmd_str = crate::instances::java_cmd(&dirp, &version, &memory, self.servers[idx].cfg.mc_cfg().map(|m| m.core.as_str()).unwrap_or("paper"));
         let _ = self.line_tx.send((idx, "[aeroPanel] iniciando instancia…".into()));
         let tx = self.line_tx.clone();
         let slot_in = self.servers[idx].console_stdin.get_or_insert_with(|| Arc::new(TMutex::new(None))).clone();
@@ -383,16 +402,26 @@ impl App {
     }
 
     /// Build a ServerCfg from the create-instance form
-    pub fn instance_to_cfg(&self) -> (String, String, String, bool) {
+    pub fn instance_to_cfg(&self) -> (String, String, String, String, bool) {
         let f = &self.form.fields;
         let name = f.first().cloned().unwrap_or_default().trim().to_string();
-        let version = f.get(1).cloned().unwrap_or_default().trim().to_string();
-        let memory = f.get(2).cloned().unwrap_or_default().trim().to_string();
+        let core = f
+            .get(1)
+            .cloned()
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let core = match core.as_str() {
+            "" | "paper" => "paper".to_string(),
+            c => c.to_string(),
+        };
+        let version = f.get(2).cloned().unwrap_or_default().trim().to_string();
+        let memory = f.get(3).cloned().unwrap_or_default().trim().to_string();
         let auto = matches!(
-            f.get(3).map(|s| s.trim().to_ascii_lowercase()).as_deref(),
+            f.get(4).map(|s| s.trim().to_ascii_lowercase()).as_deref(),
             Some("y") | Some("yes") | Some("si") | Some("sí")
         );
-        (name, version, memory, auto)
+        (name, core, version, memory, auto)
     }
 
     /// Add a server entry for a managed instance

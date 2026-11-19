@@ -64,6 +64,11 @@ fn draw_header(f: &mut Frame, a: &App, area: Rect) {
         Span::styled("* ", Style::default().fg(ACCENT)),
         Span::styled("aeroPanel", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::styled("  ·  servidores", dim()),
+        if a.daemon_tx.is_some() {
+            Span::styled("  daemon ●", Style::default().fg(GREEN))
+        } else {
+            Span::styled("  daemon ○", dim())
+        },
     ]);
     let right = format!("{spinner}  {}", Local::now().format("%H:%M:%S"));
     let block = Block::default()
@@ -376,11 +381,24 @@ fn draw_minecraft(f: &mut Frame, a: &App, area: Rect) {
         }
     };
     let (st_label, st_color) = stability(h.worst_tps());
-    let players: Vec<Line> = if h.players.is_empty() {
+    let players: Vec<Line> = if h.online.is_empty() {
         vec![Line::from(Span::styled("  (nadie conectado)", dim()))]
     } else {
-        h.players.iter().map(|p| Line::from(Span::styled(format!("  * {p}"), Style::default().fg(GREEN)))).collect()
+        h.online
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let sel = i == a.mc_player_sel;
+                let (marker, style) = if sel {
+                    (">", Style::default().fg(ACCENT))
+                } else {
+                    (" ", Style::default().fg(GREEN))
+                };
+                Line::from(Span::styled(format!("  {marker} {p}"), style))
+            })
+            .collect()
     };
+    let target = h.online.get(a.mc_player_sel).cloned().unwrap_or_default();
     let mut lines = vec![
         Line::from(vec![
             Span::styled("tps 1m/5m/15m  ", dim()),
@@ -410,6 +428,13 @@ fn draw_minecraft(f: &mut Frame, a: &App, area: Rect) {
         Line::from(Span::styled("jugadores", dim())),
     ];
     lines.extend(players);
+    if !h.online.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  [B]an  [K]ick  [o]p  → {target}"),
+            Style::default().fg(ACCENT),
+        )));
+    }
     if let Some(e) = &h.last_error {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(format!("último error: {e}"), Style::default().fg(RED))));
@@ -547,7 +572,7 @@ fn draw_footer(f: &mut Frame, a: &App, area: Rect) {
         (Screen::Detail, _) => match a.tab {
             Tab::Logs => " j/k: scroll · g: seguir · tab: pestaña · esc: volver ",
             Tab::Archivos => " j/k: moverse · enter: abrir · click en la ruta para saltar · v: editar · o: abrir en explorador · u: subir · p: subir archivo · e: descargar · r: refrescar ",
-            Tab::Gestion => " S: iniciar · X: detener · R: reiniciar · tab: pestaña · esc: volver ",
+            Tab::Gestion => " S: iniciar · X: detener · R: reiniciar · B: backup · N: red/CGNAT · T: túnel playit · tab: pestaña · esc: volver ",
             Tab::Consola => " i: escribir · esc: volver ",
             _ => " tab: pestaña · esc: volver · ?: ayuda ",
         },
@@ -574,6 +599,9 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from(vec![Span::styled(" a ", accent()), Span::styled("    añadir servidor (local/ssh)", dim())]),
         Line::from(vec![Span::styled(" d ", accent()), Span::styled("    borrar servidor de la lista", dim())]),
         Line::from(vec![Span::styled(" S/X/R ", accent()), Span::styled(" iniciar / detener / reiniciar instancia", dim())]),
+        Line::from(vec![Span::styled(" B ", accent()), Span::styled("    backup de la instancia", dim())]),
+        Line::from(vec![Span::styled(" N ", accent()), Span::styled("    detectar red (ip pública / CGNAT)", dim())]),
+        Line::from(vec![Span::styled(" T ", accent()), Span::styled("    túnel playit.gg (amigos desde internet)", dim())]),
         Line::from(vec![Span::styled(" p/e ", accent()), Span::styled("  subir / descargar archivo", dim())]),
         Line::from(vec![Span::styled(" i ", accent()), Span::styled("    escribir en la consola del servidor", dim())]),
         Line::from(vec![Span::styled(" mouse ", accent()), Span::styled(" clic en pestañas/listas · rueda scrollea", dim())]),

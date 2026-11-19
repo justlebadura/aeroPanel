@@ -4,10 +4,13 @@
 mod app;
 mod config;
 mod connection;
+mod daemon;
 mod instances;
 mod metrics;
 mod minecraft;
+mod notify;
 mod theme;
+mod tunnel;
 mod ui;
 
 use app::{App, Form, InputMode, Screen, Status, Tab};
@@ -17,6 +20,9 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args().any(|a| a == "--daemon") {
+        return daemon::run().await;
+    }
     let cfg_path = config::config_path();
     let cfg = config::load()?;
     let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<(usize, String)>();
@@ -29,6 +35,69 @@ async fn main() -> anyhow::Result<()> {
     crossterm::terminal::enable_raw_mode()?;
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
+
+    // cliente del daemon (si hay socket activo): todas las operaciones de
+    // ciclo de vida van por él, así las instancias viven aunque se cierre
+    // la TUI
+    {
+        let sock = daemon::socket_path();
+        if sock.exists() {
+            if let Ok(stream) = tokio::net::UnixStream::connect(&sock).await {
+                let (r, mut w) = tokio::io::split(stream);
+                let (dtx, mut drx) = tokio::sync::mpsc::unbounded_channel::<String>();
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    while let Some(s) = drx.recv().await {
+                        if w.write_all(format!("{s}\n").as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                let app2 = app.clone();
+                let ltx = line_tx.clone();
+                tokio::spawn(async move {
+                    use tokio::io::AsyncBufReadExt;
+                    let mut lines = tokio::io::BufReader::new(r).lines();
+                    while let Ok(Some(l)) = lines.next_line().await {
+                        let ev: serde_json::Value = match serde_json::from_str(&l) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        let mut a = app2.lock().await;
+                        match ev["ev"].as_str() {
+                            Some("line") => {
+                                if let Some(idx) = a.server_index(ev["server"].as_str().unwrap_or("")) {
+                                    let _ = ltx.send((idx, ev["text"].as_str().unwrap_or("").to_string()));
+                                }
+                            }
+                            Some("status") => {
+                                if let Some(s) = a.servers.iter_mut().find(|s| s.cfg.name == ev["server"].as_str().unwrap_or("")) {
+                                    s.status = if ev["status"].as_str() == Some("running") {
+                                        Status::Running
+                                    } else {
+                                        Status::Down
+                                    };
+                                }
+                            }
+                            Some("msg") | Some("backup") => {
+                                let text = if ev["ev"] == "backup" {
+                                    format!("[aeroPanel] backup listo: {}", ev["path"].as_str().unwrap_or(""))
+                                } else {
+                                    ev["msg"].as_str().unwrap_or("").to_string()
+                                };
+                                let idx = a.selected;
+                                let _ = a.line_tx.send((idx, text));
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+                let mut a = app.lock().await;
+                a.daemon_tx = Some(dtx);
+                let _ = a.line_tx.send((0, "[aeroPanel] daemon conectado — las instancias viven fuera de la TUI".into()));
+            }
+        }
+    }
 
     // background: metrics pollers
     {
@@ -73,8 +142,11 @@ async fn main() -> anyhow::Result<()> {
             .map(|(i, _)| i)
             .collect();
         drop(a);
-        for idx in autos {
-            app.lock().await.start_instance(idx);
+        // con daemon conectado el auto-start lo hace el propio daemon
+        if app.lock().await.daemon_tx.is_none() {
+            for idx in autos {
+                app.lock().await.start_instance(idx);
+            }
         }
     }
 
@@ -158,10 +230,14 @@ async fn main() -> anyhow::Result<()> {
                     let mut a = app.lock().await;
                     a.spinner_frame = a.spinner_frame.wrapping_add(1);
                     // restart timer
-                    if let Some((idx, at)) = a.restart_at {
+                    if let Some((_idx, at)) = a.restart_at {
                         if std::time::Instant::now() >= at {
                             a.restart_at = None;
-                            a.start_instance(idx);
+                            let name = a.sel().map(|s| s.cfg.name.clone()).unwrap_or_default();
+                            let sel = a.selected;
+                            if !daemon_send(&a, &name, "start", serde_json::json!({})) {
+                                a.start_instance(sel);
+                            }
                         }
                     }
                     // reveal animation for the files tab
@@ -407,21 +483,101 @@ async fn handle_key(app: Arc<tokio::sync::Mutex<App>>, k: crossterm::event::KeyE
             (Screen::Detail, K::Char('i')) if a.tab == Tab::Consola => {
                 a.input_mode = InputMode::ConsoleInput;
             }
+            // gestión de jugadores en la pestaña Minecraft
+            (Screen::Detail, K::Char('j')) if a.tab == Tab::Minecraft => {
+                let n = a.sel().map(|s| s.health.online.len()).unwrap_or(0);
+                if n > 0 { a.mc_player_sel = (a.mc_player_sel + 1).min(n - 1); }
+            }
+            (Screen::Detail, K::Char('k')) if a.tab == Tab::Minecraft => {
+                a.mc_player_sel = a.mc_player_sel.saturating_sub(1);
+            }
+            (Screen::Detail, K::Char('K')) if a.tab == Tab::Minecraft => {
+                let (cmd, p) = (format!("kick {}", a.mc_target()), a.mc_target().clone());
+                if !p.is_empty() { a.mc_player_sel = 0; drop(a); send_console(app, cmd).await; }
+            }
+            (Screen::Detail, K::Char('B')) if a.tab == Tab::Minecraft => {
+                let (cmd, p) = (format!("ban {}", a.mc_target()), a.mc_target().clone());
+                if !p.is_empty() { a.mc_player_sel = 0; drop(a); send_console(app, cmd).await; }
+            }
+            (Screen::Detail, K::Char('o')) if a.tab == Tab::Minecraft => {
+                let (cmd, p) = (format!("op {}", a.mc_target()), a.mc_target().clone());
+                if !p.is_empty() { drop(a); send_console(app, cmd).await; }
+            }
             (Screen::Detail, K::Char('j')) if a.tab == Tab::Logs => scroll_sel(&mut a, 3),
             (Screen::Detail, K::Char('k')) if a.tab == Tab::Logs => scroll_sel(&mut a, -3),
             (Screen::Detail, K::Char('g')) if a.tab == Tab::Logs => a.sel_mut().map(|s| s.scroll = u16::MAX).unwrap_or(()),
-            // gestión: start/stop/restart
+            // gestión: start/stop/restart (+ backup por el daemon)
             (Screen::Detail, K::Char('S')) if a.tab == Tab::Gestion => {
                 let sel = a.selected;
-                a.start_instance(sel);
+                let name = a.sel().map(|s| s.cfg.name.clone()).unwrap_or_default();
+                if !daemon_send(&a, &name, "start", serde_json::json!({})) {
+                    a.start_instance(sel);
+                }
             }
             (Screen::Detail, K::Char('X')) if a.tab == Tab::Gestion => {
                 let sel = a.selected;
-                a.stop_instance(sel, 3);
+                let name = a.sel().map(|s| s.cfg.name.clone()).unwrap_or_default();
+                if !daemon_send(&a, &name, "stop", serde_json::json!({})) {
+                    a.stop_instance(sel, 3);
+                }
             }
             (Screen::Detail, K::Char('R')) if a.tab == Tab::Gestion => {
                 let sel = a.selected;
-                a.restart_instance(sel);
+                let name = a.sel().map(|s| s.cfg.name.clone()).unwrap_or_default();
+                if !daemon_send(&a, &name, "restart", serde_json::json!({})) {
+                    a.restart_instance(sel);
+                }
+            }
+            (Screen::Detail, K::Char('B')) if a.tab == Tab::Gestion => {
+                let name = a.sel().map(|s| s.cfg.name.clone()).unwrap_or_default();
+                if !daemon_send(&a, &name, "backup", serde_json::json!({})) {
+                    let _ = a.line_tx.send((a.selected, "[aeroPanel] backup necesita el daemon (aeropanel --daemon)".into()));
+                }
+            }
+            (Screen::Detail, K::Char('N')) if a.tab == Tab::Gestion => {
+                let idx = a.selected;
+                let tx = a.line_tx.clone();
+                drop(a);
+                tokio::spawn(async move {
+                    match tunnel::net_info().await {
+                        Ok((public, local, cgnat)) => {
+                            let _ = tx.send((idx, format!("[aeroPanel] ip publica: {public}")));
+                            let _ = tx.send((idx, format!("[aeroPanel] ip local:   {local}")));
+                            if cgnat {
+                                let _ = tx.send((idx, "[aeroPanel] ⚠ CGNAT detectado: abrir puertos NO funciona → usa un túnel (T)".into()));
+                            } else {
+                                let _ = tx.send((idx, "[aeroPanel] ip pública propia: puedes abrir el 25565 en el router".into()));
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send((idx, format!("[aeroPanel] {e}")));
+                        }
+                    }
+                });
+            }
+            (Screen::Detail, K::Char('T')) if a.tab == Tab::Gestion => {
+                let idx = a.selected;
+                let tx = a.line_tx.clone();
+                let child_slot = a.sel().and_then(|s| s.child.clone());
+                drop(a);
+                tokio::spawn(async move {
+                    match tunnel::ensure_playit(idx, &tx).await {
+                        Ok(mut child) => {
+                            if let Some(out) = child.stdout.take() {
+                                crate::connection::spawn_line_reader(
+                                    tokio::io::BufReader::new(out),
+                                    tx,
+                                    idx,
+                                );
+                            }
+                            let _ = child.wait().await;
+                        }
+                        Err(e) => {
+                            let _ = tx.send((idx, format!("[aeroPanel] túnel: {e:#}")));
+                        }
+                    }
+                });
+                let _ = child_slot;
             }
             // archivos: navigation
             (Screen::Detail, K::Char('j') | K::Down) if a.tab == Tab::Archivos => {
@@ -743,17 +899,22 @@ async fn handle_form(app: Arc<tokio::sync::Mutex<App>>, a: &mut App, code: cross
         K::Enter => {
             let is_instance = a.input_mode == InputMode::FormInstance;
             if is_instance {
-                let (name, version, memory, auto) = a.instance_to_cfg();
+                let (name, core, version, memory, auto) = a.instance_to_cfg();
                 if !name.is_empty() {
                     let tx = a.line_tx.clone();
                     a.input_mode = InputMode::Normal;
                     // placeholder entry so we can stream progress lines to it
                     a.add_instance_server(&name, std::path::Path::new("…"), &version, &memory, auto);
+                    if let Some(s) = a.servers.last_mut() {
+                        if let Some(mc) = s.cfg.minecraft.as_mut() {
+                            mc.core = core.clone();
+                        }
+                    }
                     let idx = a.servers.len() - 1;
-                    let _ = tx.send((idx, format!("[aeroPanel] creando instancia {name} (paper {version}, {memory})…")));
+                    let _ = tx.send((idx, format!("[aeroPanel] creando instancia {name} ({core} {version}, {memory})…")));
                     let app_state = app;
                     tokio::spawn(async move {
-                        let r = crate::instances::create(&name, &version, &memory, &tx, idx).await;
+                        let r = crate::instances::create(&name, &version, &memory, &core, &tx, idx).await;
                         let mut a = app_state.lock().await;
                         match r {
                             Ok(dir) => {
@@ -892,18 +1053,41 @@ async fn load_files(app: Arc<tokio::sync::Mutex<App>>) {
 }
 
 async fn send_console(app: Arc<tokio::sync::Mutex<App>>, cmd: String) {
-    let slot = {
+    let (slot, via_daemon, name, idx) = {
         let a = app.lock().await;
-        match a.sel() {
-            Some(s) => match s.console_stdin.clone() {
-                Some(sl) => sl,
-                None => return,
-            },
-            None => return,
-        }
+        (
+            a.sel().and_then(|s| s.console_stdin.clone()),
+            a.daemon_tx.clone(),
+            a.sel().map(|s| s.cfg.name.clone()).unwrap_or_default(),
+            a.selected,
+        )
+    };
+    if let Some(tx) = via_daemon {
+        let _ = tx.send(serde_json::to_string(&serde_json::json!({
+            "cmd": "console", "server": name, "text": cmd
+        })).unwrap_or_default());
+        return;
+    }
+    let slot = match slot {
+        Some(sl) => sl,
+        None => return,
     };
     let mut guard = slot.lock().await;
     if let Some(stdin) = guard.as_mut() {
         let _ = console_send(stdin, &cmd).await;
     }
+    let _ = idx;
+}
+
+/// manda una orden al daemon; false si no hay daemon conectado
+fn daemon_send(a: &App, name: &str, op: &str, extra: serde_json::Value) -> bool {
+    let Some(tx) = &a.daemon_tx else { return false };
+    let mut v = serde_json::json!({ "cmd": op, "server": name });
+    if let (Some(o), Some(x)) = (v.as_object_mut(), extra.as_object()) {
+        for (k, val) in x {
+            o.insert(k.clone(), val.clone());
+        }
+    }
+    let _ = tx.send(serde_json::to_string(&v).unwrap_or_default());
+    true
 }

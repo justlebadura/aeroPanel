@@ -73,10 +73,56 @@ src/
 ├── config.rs       # TOML config (serde)
 ├── connection.rs   # local/SSH execution, stream spawn, console, upload/download, ls
 ├── instances.rs    # Paper instance creation (jar, eula, properties, launch)
+├── daemon.rs       # headless daemon: owns instances, scheduler, backups, socket API
+├── notify.rs       # Discord/Telegram notifications (via curl)
 ├── metrics.rs      # /proc probe (loadavg, uptime, meminfo, CPU by double sampling)
 ├── minecraft.rs    # log parser (TPS/MSPT, joins/leaves/chat/deaths/errors)
 ├── theme.rs        # OpenCode-style palette
 └── ui.rs           # ratatui render (dashboard, tabs, gauges, sparklines, console)
+```
+
+## Daemon mode (recomendado)
+
+Sin daemon, la TUI es la dueña de las instancias (se mueren si cierras aeroPanel).
+Con el daemon, las instancias viven fuera de la TUI, y el scheduler, los
+backups y las notificaciones siguen corriendo aunque no tengas la TUI abierta:
+
+```bash
+# a mano
+./target/release/aeropanel --daemon
+
+# o como servicio de usuario
+systemctl --user enable --now aeropanel-daemon   # unit incluida en el repo
+```
+
+La TUI se conecta sola al socket del daemon (`~/.config/aeropanel/daemon.sock`)
+y muestra `daemon ●` en la cabecera. Con daemon conectado:
+
+- `S`/`X`/`R` mandan start/stop/restart por el socket (viven sin TUI)
+- `B` en Gestion = backup manual ahora (`tar.gz` con retención de 5)
+- las líneas de consola de las instancias llegan por el socket
+- avisos (Discord/Telegram) al arrancar, caer o si el TPS baja
+
+### Scheduler y notificaciones (config.toml)
+
+```toml
+[[schedule]]
+name = "backup cada 6h"
+server = "mi-instancia"
+action = "backup"        # backup | restart | command
+every_secs = 21600
+
+[[schedule]]
+name = "restart diario"
+server = "mi-instancia"
+action = "restart"
+at = "04:00"             # HH:MM local, una vez al día
+
+[notify]
+discord_webhook = ""     # webhook de Discord (opcional)
+telegram_token = ""      # bot token de Telegram (opcional)
+telegram_chat = ""
+tps_below = 15.0         # avisar si TPS 1m baja de esto
 ```
 
 ## Support

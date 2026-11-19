@@ -1,0 +1,12 @@
+# systemctl --user enable --now aeropanel-daemon
+[Unit]
+Description=aeroPanel daemon (gestor de instancias Minecraft)
+After=network.target
+
+[Service]
+ExecStart=%h/Documentos/GitHub/aeroPanel/target/release/aeropanel --daemon
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
